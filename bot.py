@@ -1,4 +1,5 @@
 import asyncio
+import base64
 import json
 import logging
 import os
@@ -19,8 +20,12 @@ from yt_dlp.utils import DownloadError
 BASE_DIR = Path(__file__).resolve().parent
 DATA_DIR = BASE_DIR / "data" / "chats"
 STATE_FILE_NAME = "state.json"
+COOKIES_FILE_NAME = "cookies.txt"
 MAX_CUT_SECONDS = 20 * 60
 TELEGRAM_MESSAGE_LIMIT = 4000
+TELEGRAM_VIDEO_LIMIT_BYTES = 49 * 1024 * 1024
+PREVIEW_WIDTH = 640
+PREVIEW_HEIGHT = 360
 GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-1.5-flash")
 
 
@@ -39,6 +44,10 @@ def get_chat_dir(chat_id: int) -> Path:
 
 def get_state_path(chat_id: int) -> Path:
     return get_chat_dir(chat_id) / STATE_FILE_NAME
+
+
+def get_cookies_path(chat_id: int) -> Path:
+    return get_chat_dir(chat_id) / COOKIES_FILE_NAME
 
 
 def load_state(chat_id: int) -> Dict[str, Any]:
@@ -65,6 +74,28 @@ def delete_path(path_str: Optional[str]) -> None:
     path = Path(path_str)
     if path.exists():
         path.unlink()
+
+
+def ensure_youtube_cookies(chat_id: int) -> Optional[Path]:
+    encoded_cookies = os.getenv("YOUTUBE_COOKIES_BASE64", "").strip()
+    raw_cookies = os.getenv("YOUTUBE_COOKIES", "").strip()
+
+    content: Optional[str] = None
+    if encoded_cookies:
+        try:
+            content = base64.b64decode(encoded_cookies).decode("utf-8")
+        except Exception as exc:
+            logger.exception("Falha ao decodificar YOUTUBE_COOKIES_BASE64")
+            raise RuntimeError("A variavel YOUTUBE_COOKIES_BASE64 esta invalida.") from exc
+    elif raw_cookies:
+        content = raw_cookies
+
+    if not content:
+        return None
+
+    cookies_path = get_cookies_path(chat_id)
+    cookies_path.write_text(content, encoding="utf-8")
+    return cookies_path
 
 
 def clear_chat_storage(chat_id: int, keep_directory: bool = True) -> None:
@@ -128,6 +159,7 @@ def find_first_existing_file(chat_dir: Path, patterns: list[str]) -> Optional[Pa
 def download_video_for_chat(chat_id: int, url: str) -> Dict[str, Any]:
     chat_dir = get_chat_dir(chat_id)
     clear_previous_media(chat_id)
+    cookies_path = ensure_youtube_cookies(chat_id)
 
     output_template = str(chat_dir / "source.%(ext)s")
     logger.info("Baixando video para chat %s: %s", chat_id, url)
@@ -145,6 +177,8 @@ def download_video_for_chat(chat_id: int, url: str) -> Dict[str, Any]:
             }
         },
     }
+    if cookies_path:
+        ydl_opts["cookiefile"] = str(cookies_path)
 
     try:
         with YoutubeDL(ydl_opts) as ydl:
@@ -184,11 +218,18 @@ def download_video_for_chat(chat_id: int, url: str) -> Dict[str, Any]:
     return state
 
 
-def run_ffmpeg_cut(input_path: Path, output_path: Path, start_seconds: int, end_seconds: int) -> None:
+def run_ffmpeg_cut(
+    input_path: Path,
+    output_path: Path,
+    start_seconds: int,
+    end_seconds: int,
+    preview: bool = False,
+) -> None:
     duration = end_seconds - start_seconds
     command = [
         "ffmpeg",
         "-y",
+        "-nostdin",
         "-i",
         str(input_path),
         "-ss",
@@ -199,16 +240,48 @@ def run_ffmpeg_cut(input_path: Path, output_path: Path, start_seconds: int, end_
         "make_zero",
         "-c:v",
         "libx264",
-        "-preset",
-        "veryfast",
-        "-crf",
-        "23",
-        "-c:a",
-        "aac",
-        "-movflags",
-        "+faststart",
-        str(output_path),
     ]
+
+    if preview:
+        preview_filter = (
+            f"scale=w={PREVIEW_WIDTH}:h={PREVIEW_HEIGHT}:force_original_aspect_ratio=decrease,"
+            f"pad={PREVIEW_WIDTH}:{PREVIEW_HEIGHT}:(ow-iw)/2:(oh-ih)/2:color=black"
+        )
+        command.extend(
+            [
+                "-vf",
+                preview_filter,
+                "-preset",
+                "veryfast",
+                "-crf",
+                "30",
+                "-c:a",
+                "aac",
+                "-b:a",
+                "96k",
+            ]
+        )
+    else:
+        command.extend(
+            [
+                "-preset",
+                "slow",
+                "-crf",
+                "18",
+                "-c:a",
+                "aac",
+                "-b:a",
+                "192k",
+            ]
+        )
+
+    command.extend(
+        [
+            "-movflags",
+            "+faststart",
+            str(output_path),
+        ]
+    )
 
     logger.info("Executando ffmpeg: %s", " ".join(command))
     try:
@@ -226,6 +299,9 @@ def run_ffmpeg_cut(input_path: Path, output_path: Path, start_seconds: int, end_
         logger.error("Erro no ffmpeg: %s", exc.stderr.strip())
         raise RuntimeError("Falha ao gerar o corte com ffmpeg.") from exc
 
+    if not output_path.exists() or output_path.stat().st_size == 0:
+        raise RuntimeError("O ffmpeg terminou, mas o arquivo do corte nao foi gerado corretamente.")
+
 
 def sanitize_filename(value: str) -> str:
     sanitized = re.sub(r'[<>:"/\\|?*]+', "", value).strip()
@@ -236,6 +312,7 @@ def sanitize_filename(value: str) -> str:
 def download_subtitle_for_chat(chat_id: int, url: str) -> Path:
     chat_dir = get_chat_dir(chat_id)
     state = load_state(chat_id)
+    cookies_path = ensure_youtube_cookies(chat_id)
     delete_path(state.get("subtitle_path"))
 
     for old_file in chat_dir.glob("subtitle*"):
@@ -256,6 +333,8 @@ def download_subtitle_for_chat(chat_id: int, url: str) -> Path:
         "quiet": True,
         "no_warnings": True,
     }
+    if cookies_path:
+        ydl_opts["cookiefile"] = str(cookies_path)
 
     try:
         with YoutubeDL(ydl_opts) as ydl:
@@ -412,11 +491,14 @@ async def corte_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
         await update.message.reply_text("Nenhum video atual foi encontrado. Use /video primeiro.")
         return
 
-    output_path = get_chat_dir(chat_id) / f"{sanitize_filename(clip_name)}.mp4"
-    if output_path.exists():
-        output_path.unlink(missing_ok=True)
+    safe_name = sanitize_filename(clip_name)
+    output_path = get_chat_dir(chat_id) / f"{safe_name}.mp4"
+    preview_path = get_chat_dir(chat_id) / f"{safe_name}_preview.mp4"
+    for path in (output_path, preview_path):
+        if path.exists():
+            path.unlink(missing_ok=True)
 
-    await update.message.reply_text("Gerando o corte solicitado.")
+    await update.message.reply_text("Gerando o corte em alta qualidade e uma previa para conferencia.")
     await context.bot.send_chat_action(chat_id=chat_id, action=ChatAction.UPLOAD_VIDEO)
 
     try:
@@ -426,9 +508,22 @@ async def corte_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
             output_path,
             start_seconds,
             end_seconds,
+            False,
+        )
+        await asyncio.to_thread(
+            run_ffmpeg_cut,
+            Path(video_path),
+            preview_path,
+            start_seconds,
+            end_seconds,
+            True,
         )
     except RuntimeError as exc:
         await update.message.reply_text(str(exc))
+        return
+
+    if not output_path.exists() or not preview_path.exists():
+        await update.message.reply_text("Os arquivos do corte nao foram encontrados apos o processamento.")
         return
 
     caption = (
@@ -436,8 +531,43 @@ async def corte_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
         f"\u23F1\uFE0F Trecho: {normalize_time_label(start_label)} \u2192 {normalize_time_label(end_label)}"
     )
 
-    with output_path.open("rb") as video_file:
-        await update.message.reply_video(video=video_file, caption=caption)
+    file_size = output_path.stat().st_size
+    preview_size = preview_path.stat().st_size
+    logger.info("Corte HQ gerado para chat %s: %s bytes", chat_id, file_size)
+    logger.info("Previa do corte gerada para chat %s: %s bytes", chat_id, preview_size)
+
+    try:
+        with preview_path.open("rb") as preview_file:
+            await update.message.reply_video(
+                video=preview_file,
+                caption=f"{caption}\n\nPrevia compactada para revisao rapida.",
+                supports_streaming=True,
+                read_timeout=120,
+                write_timeout=120,
+                connect_timeout=30,
+                pool_timeout=30,
+            )
+    except Exception:
+        logger.exception("Falha ao enviar previa do corte do chat %s", chat_id)
+        await update.message.reply_text("A previa do corte falhou, mas vou enviar o arquivo final em seguida.")
+
+    try:
+        with output_path.open("rb") as video_file:
+            await update.message.reply_document(
+                document=video_file,
+                filename=output_path.name,
+                caption=f"{caption}\n\nArquivo final em melhor qualidade.",
+                read_timeout=120,
+                write_timeout=120,
+                connect_timeout=30,
+                pool_timeout=30,
+            )
+    except Exception:
+        logger.exception("Falha ao enviar corte do chat %s", chat_id)
+        await update.message.reply_text(
+            "O corte foi gerado, mas houve falha ao enviar o arquivo no Telegram. "
+            "Tente um trecho menor."
+        )
 
 
 async def limpar_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
