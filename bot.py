@@ -10,6 +10,10 @@ from pathlib import Path
 from typing import Any, Dict, Optional
 
 import google.generativeai as genai
+from google.oauth2 import service_account
+from googleapiclient.discovery import build
+from googleapiclient.errors import HttpError
+from googleapiclient.http import MediaIoBaseDownload
 from telegram import Update
 from telegram.constants import ChatAction
 from telegram.ext import Application, CommandHandler, ContextTypes
@@ -28,6 +32,7 @@ PREVIEW_WIDTH = 640
 PREVIEW_HEIGHT = 360
 GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-1.5-flash")
 DEFAULT_WEBHOOK_PATH = "telegram"
+GOOGLE_DRIVE_SCOPES = ["https://www.googleapis.com/auth/drive.readonly"]
 
 
 logging.basicConfig(
@@ -97,6 +102,96 @@ def ensure_youtube_cookies(chat_id: int) -> Optional[Path]:
     cookies_path = get_cookies_path(chat_id)
     cookies_path.write_text(content, encoding="utf-8")
     return cookies_path
+
+
+def load_google_service_account_info() -> Dict[str, Any]:
+    encoded_json = os.getenv("GOOGLE_SERVICE_ACCOUNT_JSON_BASE64", "").strip()
+    raw_json = os.getenv("GOOGLE_SERVICE_ACCOUNT_JSON", "").strip()
+
+    try:
+        if encoded_json:
+            return json.loads(base64.b64decode(encoded_json).decode("utf-8"))
+        if raw_json:
+            return json.loads(raw_json)
+    except Exception as exc:
+        logger.exception("Falha ao carregar credenciais do Google Drive")
+        raise RuntimeError("As credenciais do Google Drive estao invalidas.") from exc
+
+    raise RuntimeError(
+        "Google Drive nao configurado. Defina GOOGLE_SERVICE_ACCOUNT_JSON_BASE64 "
+        "ou GOOGLE_SERVICE_ACCOUNT_JSON."
+    )
+
+
+def build_drive_service():
+    credentials = service_account.Credentials.from_service_account_info(
+        load_google_service_account_info(),
+        scopes=GOOGLE_DRIVE_SCOPES,
+    )
+    return build("drive", "v3", credentials=credentials, cache_discovery=False)
+
+
+def list_drive_videos() -> list[Dict[str, Any]]:
+    folder_id = os.getenv("GOOGLE_DRIVE_FOLDER_ID", "").strip()
+    if not folder_id:
+        raise RuntimeError("Defina GOOGLE_DRIVE_FOLDER_ID para usar /drive.")
+
+    try:
+        service = build_drive_service()
+        response = (
+            service.files()
+            .list(
+                q=(
+                    f"'{folder_id}' in parents and trashed = false and "
+                    "mimeType contains 'video/'"
+                ),
+                fields="files(id, name, mimeType, size, modifiedTime)",
+                orderBy="name_natural",
+                pageSize=100,
+                supportsAllDrives=True,
+                includeItemsFromAllDrives=True,
+            )
+            .execute()
+        )
+    except HttpError as exc:
+        logger.exception("Erro ao listar arquivos do Google Drive")
+        raise RuntimeError("Nao foi possivel listar os videos da pasta no Google Drive.") from exc
+
+    files = response.get("files", [])
+    if not files:
+        raise RuntimeError("Nenhum video foi encontrado na pasta configurada do Google Drive.")
+    return files
+
+
+def download_drive_video_for_chat(chat_id: int, file_id: str, file_name: str) -> Dict[str, Any]:
+    chat_dir = get_chat_dir(chat_id)
+    clear_previous_media(chat_id)
+    safe_name = sanitize_filename(Path(file_name).stem)
+    output_path = chat_dir / f"{safe_name}.mp4"
+
+    try:
+        service = build_drive_service()
+        request = service.files().get_media(fileId=file_id, supportsAllDrives=True)
+        with output_path.open("wb") as output_file:
+            downloader = MediaIoBaseDownload(output_file, request)
+            done = False
+            while not done:
+                _, done = downloader.next_chunk()
+    except HttpError as exc:
+        logger.exception("Erro ao baixar arquivo do Google Drive")
+        raise RuntimeError("Nao foi possivel baixar o video selecionado do Google Drive.") from exc
+
+    state = {
+        "source_url": f"drive:{file_id}",
+        "title": file_name,
+        "video_path": str(output_path),
+        "subtitle_path": None,
+        "source_type": "drive",
+        "drive_file_id": file_id,
+    }
+    save_state(chat_id, state)
+    logger.info("Video do Drive salvo no chat %s: %s", chat_id, output_path)
+    return state
 
 
 def clear_chat_storage(chat_id: int, keep_directory: bool = True) -> None:
@@ -213,6 +308,7 @@ def download_video_for_chat(chat_id: int, url: str) -> Dict[str, Any]:
         "title": info.get("title") or "Video sem titulo",
         "video_path": str(video_path),
         "subtitle_path": None,
+        "source_type": "youtube",
     }
     save_state(chat_id, state)
     logger.info("Video salvo no chat %s: %s", chat_id, video_path)
@@ -421,7 +517,10 @@ async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
         "Bot pronto para cortes de videos do YouTube.\n\n"
         "Comandos:\n"
         "/video LINK\n"
+        "/drive\n"
+        "/carregar NUMERO\n"
         "/corte NOME | INICIO FIM\n"
+        "/cortes NOME | INICIO FIM ; NOME | INICIO FIM\n"
         "/aut\n"
         "/legenda\n"
         "/maquina\n"
@@ -450,6 +549,105 @@ async def video_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
         return
 
     await update.message.reply_text(f"Video atual salvo com sucesso:\n{state['title']}")
+
+
+async def drive_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not update.message:
+        return
+
+    chat_id = update.effective_chat.id
+    await update.message.reply_text("Listando videos da pasta do Google Drive.")
+    await context.bot.send_chat_action(chat_id=chat_id, action=ChatAction.TYPING)
+
+    try:
+        files = await asyncio.to_thread(list_drive_videos)
+    except RuntimeError as exc:
+        await update.message.reply_text(str(exc))
+        return
+
+    state = load_state(chat_id)
+    state["drive_listing"] = [
+        {
+            "index": index,
+            "id": file_info["id"],
+            "name": file_info["name"],
+        }
+        for index, file_info in enumerate(files, start=1)
+    ]
+    save_state(chat_id, state)
+
+    lines = ["Videos disponiveis no Drive:"]
+    for item in state["drive_listing"]:
+        lines.append(f"{item['index']}. {item['name']}")
+    lines.append("")
+    lines.append("Responda com /carregar NUMERO para selecionar um video.")
+    await send_long_message(update, "\n".join(lines))
+
+
+async def carregar_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not update.message:
+        return
+    if not context.args:
+        await update.message.reply_text("Uso: /carregar NUMERO")
+        return
+
+    chat_id = update.effective_chat.id
+    state = load_state(chat_id)
+    listing = state.get("drive_listing") or []
+    if not listing:
+        await update.message.reply_text("Nenhuma listagem do Drive foi encontrada. Use /drive primeiro.")
+        return
+
+    try:
+        selected_index = int(context.args[0])
+    except ValueError:
+        await update.message.reply_text("Use um numero valido da listagem do Drive.")
+        return
+
+    selected_item = next((item for item in listing if item["index"] == selected_index), None)
+    if not selected_item:
+        await update.message.reply_text("Numero nao encontrado. Use /drive para ver a lista atual.")
+        return
+
+    await update.message.reply_text(f"Baixando do Drive: {selected_item['name']}")
+    await context.bot.send_chat_action(chat_id=chat_id, action=ChatAction.UPLOAD_VIDEO)
+
+    try:
+        new_state = await asyncio.to_thread(
+            download_drive_video_for_chat,
+            chat_id,
+            selected_item["id"],
+            selected_item["name"],
+        )
+    except RuntimeError as exc:
+        await update.message.reply_text(str(exc))
+        return
+
+    post_state = load_state(chat_id)
+    post_state["drive_listing"] = listing
+    save_state(chat_id, post_state)
+
+    await update.message.reply_text(
+        f"Video atual salvo com sucesso:\n{new_state['title']}\n\n"
+        "Agora envie os cortes com /corte ou varios de uma vez com /cortes."
+    )
+
+
+def parse_batch_cuts(payload: str) -> list[tuple[str, str, str]]:
+    items = []
+    for raw_entry in [entry.strip() for entry in payload.split(";") if entry.strip()]:
+        if "|" not in raw_entry:
+            raise ValueError("Cada corte deve seguir o formato NOME | INICIO FIM")
+        name_part, _, time_part = raw_entry.partition("|")
+        clip_name = name_part.strip()
+        time_tokens = time_part.strip().split()
+        if not clip_name or len(time_tokens) != 2:
+            raise ValueError("Cada corte deve seguir o formato NOME | INICIO FIM")
+        items.append((clip_name, time_tokens[0], time_tokens[1]))
+
+    if not items:
+        raise ValueError("Informe ao menos um corte.")
+    return items
 
 
 async def corte_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -571,6 +769,30 @@ async def corte_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
         )
 
 
+async def cortes_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not update.message:
+        return
+
+    raw_text = update.message.text or ""
+    _, _, payload = raw_text.partition(" ")
+    payload = payload.strip()
+    if not payload:
+        await update.message.reply_text("Uso: /cortes NOME | INICIO FIM ; NOME | INICIO FIM")
+        return
+
+    try:
+        batch_items = parse_batch_cuts(payload)
+    except ValueError as exc:
+        await update.message.reply_text(str(exc))
+        return
+
+    await update.message.reply_text(f"Recebi {len(batch_items)} cortes. Vou processar em sequencia.")
+
+    for clip_name, start_label, end_label in batch_items:
+        update.message.text = f"/corte {clip_name} | {start_label} {end_label}"
+        await corte_command(update, context)
+
+
 async def limpar_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not update.message:
         return
@@ -589,6 +811,9 @@ async def aut_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
     source_url = state.get("source_url")
     if not source_url:
         await update.message.reply_text("Nenhum video atual foi encontrado. Use /video primeiro.")
+        return
+    if state.get("source_type") != "youtube":
+        await update.message.reply_text("O comando /aut so funciona para videos carregados do YouTube.")
         return
 
     await update.message.reply_text("Baixando a legenda automatica em portugues.")
@@ -714,7 +939,10 @@ def build_application() -> Application:
     application = Application.builder().token(token).build()
     application.add_handler(CommandHandler("start", start_command))
     application.add_handler(CommandHandler("video", video_command))
+    application.add_handler(CommandHandler("drive", drive_command))
+    application.add_handler(CommandHandler("carregar", carregar_command))
     application.add_handler(CommandHandler("corte", corte_command))
+    application.add_handler(CommandHandler("cortes", cortes_command))
     application.add_handler(CommandHandler("limpar", limpar_command))
     application.add_handler(CommandHandler("aut", aut_command))
     application.add_handler(CommandHandler("legenda", legenda_command))

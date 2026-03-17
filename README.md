@@ -6,7 +6,10 @@ Projeto Python pronto para GitHub e Railway de um bot Telegram que baixa videos 
 
 - `/start`: mostra os comandos disponiveis.
 - `/video LINK`: baixa o video do YouTube e salva um video atual por chat.
+- `/drive`: lista os videos da pasta configurada no Google Drive.
+- `/carregar NUMERO`: baixa um video da listagem do Google Drive e salva como video atual.
 - `/corte NOME | INICIO FIM`: gera e envia um corte do video atual.
+- `/cortes NOME | INICIO FIM ; NOME | INICIO FIM`: gera varios cortes em sequencia.
 - `/limpar`: remove video, legenda e estado do chat.
 - `/aut`: baixa a legenda automatica em portugues do video atual.
 - `/legenda`: envia o arquivo `.srt` atual.
@@ -27,6 +30,9 @@ Projeto Python pronto para GitHub e Railway de um bot Telegram que baixa videos 
 - `LOG_LEVEL`: opcional, padrao `INFO`
 - `YOUTUBE_COOKIES_BASE64`: opcional, recomendado quando o YouTube exigir autenticacao anti-bot
 - `YOUTUBE_COOKIES`: opcional, alternativa em texto puro ao arquivo de cookies
+- `GOOGLE_DRIVE_FOLDER_ID`: opcional, obrigatoria para usar `/drive`
+- `GOOGLE_SERVICE_ACCOUNT_JSON_BASE64`: opcional, recomendada para integrar com Google Drive
+- `GOOGLE_SERVICE_ACCOUNT_JSON`: opcional, alternativa em texto puro ao JSON da service account
 - `WEBHOOK_URL`: opcional, ativa modo webhook quando definida
 - `WEBHOOK_PATH`: opcional, padrao `telegram`
 - `WEBHOOK_SECRET_TOKEN`: opcional, recomendado para validar chamadas do Telegram
@@ -92,6 +98,24 @@ $env:WEBHOOK_SECRET_TOKEN="um-segredo-forte"
 
 Tambem aceita `hh:mm:ss`. O corte tem limite de 20 minutos.
 
+### Gerar varios cortes em sequencia
+
+```text
+/cortes Hook inicial | 00:15 01:05 ; CTA final | 05:10 05:40
+```
+
+### Listar videos do Google Drive
+
+```text
+/drive
+```
+
+O bot responde com a lista numerada da pasta configurada. Depois selecione um item:
+
+```text
+/carregar 2
+```
+
 ### Baixar legenda automatica
 
 ```text
@@ -153,6 +177,8 @@ git push -u origin main
    - `TELEGRAM_BOT_TOKEN`
    - `GEMINI_API_KEY` se quiser usar `/maquina`
    - `YOUTUBE_COOKIES_BASE64` se o YouTube bloquear downloads com mensagem de anti-bot
+   - `GOOGLE_DRIVE_FOLDER_ID` se quiser listar videos da pasta do Drive
+   - `GOOGLE_SERVICE_ACCOUNT_JSON_BASE64` para autenticar no Google Drive
    - `WEBHOOK_URL` se quiser reduzir uso continuo de polling
    - `WEBHOOK_SECRET_TOKEN` recomendado se ativar webhook
 4. O Railway usara:
@@ -201,3 +227,34 @@ Exemplo no PowerShell:
 ```
 
 O bot vai decodificar essa variavel e usar o arquivo de cookies automaticamente nos downloads e nas legendas.
+
+## Google Drive
+
+Para usar `/drive` e `/carregar`, configure uma service account do Google com acesso de leitura a pasta do Drive.
+
+Fluxo recomendado:
+
+1. Crie uma service account no Google Cloud.
+2. Gere a chave JSON da service account.
+3. Compartilhe a pasta do Google Drive com o email da service account como leitor.
+4. Pegue o ID da pasta no link do Drive.
+5. Configure no ambiente:
+   - `GOOGLE_DRIVE_FOLDER_ID`
+   - `GOOGLE_SERVICE_ACCOUNT_JSON_BASE64`
+
+Exemplo para converter o JSON da service account em Base64 no PowerShell:
+
+```powershell
+[Convert]::ToBase64String([IO.File]::ReadAllBytes("service-account.json"))
+```
+
+Depois:
+
+1. Envie `/drive`
+2. Escolha um item com `/carregar NUMERO`
+3. Gere um corte com `/corte` ou varios de uma vez com `/cortes`
+
+Observacao:
+
+- `/aut` continua sendo exclusivo para videos carregados do YouTube
+- Para videos do Drive, se voce quiser usar `/maquina`, sera preciso carregar uma legenda `.srt` por outro fluxo
