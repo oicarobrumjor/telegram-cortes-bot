@@ -25,6 +25,12 @@ Projeto Python pronto para GitHub e Railway de um bot Telegram que baixa videos 
 - `GEMINI_API_KEY`: opcional
 - `GEMINI_MODEL`: opcional, padrao `gemini-1.5-flash`
 - `LOG_LEVEL`: opcional, padrao `INFO`
+- `YOUTUBE_COOKIES_BASE64`: opcional, recomendado quando o YouTube exigir autenticacao anti-bot
+- `YOUTUBE_COOKIES`: opcional, alternativa em texto puro ao arquivo de cookies
+- `WEBHOOK_URL`: opcional, ativa modo webhook quando definida
+- `WEBHOOK_PATH`: opcional, padrao `telegram`
+- `WEBHOOK_SECRET_TOKEN`: opcional, recomendado para validar chamadas do Telegram
+- `PORT`: opcional, padrao `8080` no webhook
 
 ## Como rodar localmente
 
@@ -50,10 +56,24 @@ $env:TELEGRAM_BOT_TOKEN="SEU_TOKEN"
 $env:GEMINI_API_KEY="SUA_CHAVE_OPCIONAL"
 ```
 
+Se precisar usar cookies do YouTube, voce pode carregar um `cookies.txt` local em Base64:
+
+```powershell
+$env:YOUTUBE_COOKIES_BASE64=[Convert]::ToBase64String([IO.File]::ReadAllBytes("cookies.txt"))
+```
+
 5. Inicie o bot:
 
 ```bash
 python bot.py
+```
+
+Por padrao o bot sobe em `polling`. Se quiser testar `webhook`, defina tambem:
+
+```powershell
+$env:WEBHOOK_URL="https://seu-app.up.railway.app"
+$env:WEBHOOK_PATH="telegram"
+$env:WEBHOOK_SECRET_TOKEN="um-segredo-forte"
 ```
 
 ## Uso no Telegram
@@ -132,10 +152,29 @@ git push -u origin main
 3. Configure as variaveis:
    - `TELEGRAM_BOT_TOKEN`
    - `GEMINI_API_KEY` se quiser usar `/maquina`
+   - `YOUTUBE_COOKIES_BASE64` se o YouTube bloquear downloads com mensagem de anti-bot
+   - `WEBHOOK_URL` se quiser reduzir uso continuo de polling
+   - `WEBHOOK_SECRET_TOKEN` recomendado se ativar webhook
 4. O Railway usara:
    - `Procfile` com `worker: python bot.py`
    - `railway.json` com `startCommand` igual a `python bot.py`
    - `nixpacks.toml` para instalar `ffmpeg`
+
+### Modo webhook no Railway
+
+Se quiser economizar e evitar polling continuo, configure:
+
+- `WEBHOOK_URL`: URL publica do servico no Railway, por exemplo `https://seu-app.up.railway.app`
+- `WEBHOOK_PATH`: opcional, padrao `telegram`
+- `WEBHOOK_SECRET_TOKEN`: recomendado
+
+Com isso, o bot passa a usar:
+
+```text
+https://seu-app.up.railway.app/telegram
+```
+
+Se `WEBHOOK_URL` nao estiver definida, o bot continua usando polling. Isso permite migracao segura sem quebrar o modo atual.
 
 ## Observacoes tecnicas
 
@@ -143,3 +182,22 @@ git push -u origin main
 - Ao trocar de video com `/video`, o bot remove arquivos antigos antes de salvar o novo.
 - O estado guarda apenas o video e a legenda atuais, evitando reutilizacao de arquivos antigos.
 - Erros de `yt-dlp`, `ffmpeg`, legenda e Gemini sao tratados com mensagens amigaveis no Telegram.
+- Se `YOUTUBE_COOKIES_BASE64` ou `YOUTUBE_COOKIES` estiverem definidos, o bot grava um `cookies.txt` temporario por chat e o usa no `yt-dlp`.
+
+## Cookies do YouTube
+
+Se o bot retornar algo como `Sign in to confirm you’re not a bot`, exporte os cookies da sua sessao do YouTube e configure no ambiente.
+
+Fluxo recomendado:
+
+1. Exporte um arquivo `cookies.txt` da sua sessao do navegador.
+2. Converta o arquivo para Base64 localmente.
+3. Cole o resultado na variavel `YOUTUBE_COOKIES_BASE64` do Railway.
+
+Exemplo no PowerShell:
+
+```powershell
+[Convert]::ToBase64String([IO.File]::ReadAllBytes("cookies.txt"))
+```
+
+O bot vai decodificar essa variavel e usar o arquivo de cookies automaticamente nos downloads e nas legendas.

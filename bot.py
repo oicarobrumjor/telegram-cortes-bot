@@ -27,6 +27,7 @@ TELEGRAM_VIDEO_LIMIT_BYTES = 49 * 1024 * 1024
 PREVIEW_WIDTH = 640
 PREVIEW_HEIGHT = 360
 GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-1.5-flash")
+DEFAULT_WEBHOOK_PATH = "telegram"
 
 
 logging.basicConfig(
@@ -725,6 +726,27 @@ def build_application() -> Application:
 def main() -> None:
     logger.info("Iniciando bot Telegram de cortes")
     application = build_application()
+    webhook_url = os.getenv("WEBHOOK_URL", "").strip()
+
+    if webhook_url:
+        port = int(os.getenv("PORT", "8080"))
+        listen = os.getenv("WEBHOOK_LISTEN", "0.0.0.0")
+        url_path = os.getenv("WEBHOOK_PATH", DEFAULT_WEBHOOK_PATH).strip().strip("/")
+        secret_token = os.getenv("WEBHOOK_SECRET_TOKEN", "").strip() or None
+        final_webhook_url = f"{webhook_url.rstrip('/')}/{url_path}"
+
+        logger.info("Iniciando em modo webhook na porta %s com URL %s", port, final_webhook_url)
+        application.run_webhook(
+            listen=listen,
+            port=port,
+            url_path=url_path,
+            webhook_url=final_webhook_url,
+            drop_pending_updates=True,
+            secret_token=secret_token,
+        )
+        return
+
+    logger.info("Iniciando em modo polling")
     application.run_polling(drop_pending_updates=True)
 
 
