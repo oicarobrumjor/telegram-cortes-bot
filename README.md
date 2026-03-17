@@ -8,8 +8,9 @@ Projeto Python pronto para GitHub e Railway de um bot Telegram que baixa videos 
 - `/video LINK`: baixa o video do YouTube e salva um video atual por chat.
 - `/drive`: lista os videos da pasta configurada no Google Drive.
 - `/carregar NUMERO`: baixa um video da listagem do Google Drive e salva como video atual.
-- `/corte NOME | INICIO FIM`: gera e envia um corte do video atual.
+- `/corte NOME | INICIO FIM`: gera a previa do corte e salva o arquivo final em alta qualidade.
 - `/cortes NOME | INICIO FIM ; NOME | INICIO FIM`: gera varios cortes em sequencia.
+- `/youtube TITULO | DESCRICAO`: envia o ultimo corte gerado para o YouTube.
 - `/limpar`: remove video, legenda e estado do chat.
 - `/aut`: baixa a legenda automatica em portugues do video atual.
 - `/legenda`: envia o arquivo `.srt` atual.
@@ -33,6 +34,10 @@ Projeto Python pronto para GitHub e Railway de um bot Telegram que baixa videos 
 - `GOOGLE_DRIVE_FOLDER_ID`: opcional, obrigatoria para usar `/drive`
 - `GOOGLE_SERVICE_ACCOUNT_JSON_BASE64`: opcional, recomendada para integrar com Google Drive
 - `GOOGLE_SERVICE_ACCOUNT_JSON`: opcional, alternativa em texto puro ao JSON da service account
+- `YOUTUBE_CLIENT_ID`: opcional, obrigatoria para usar `/youtube`
+- `YOUTUBE_CLIENT_SECRET`: opcional, obrigatoria para usar `/youtube`
+- `YOUTUBE_REFRESH_TOKEN`: opcional, obrigatoria para usar `/youtube`
+- `YOUTUBE_UPLOAD_PRIVACY_STATUS`: opcional, padrao `unlisted`
 - `WEBHOOK_URL`: opcional, ativa modo webhook quando definida
 - `WEBHOOK_PATH`: opcional, padrao `telegram`
 - `WEBHOOK_SECRET_TOKEN`: opcional, recomendado para validar chamadas do Telegram
@@ -96,7 +101,7 @@ $env:WEBHOOK_SECRET_TOKEN="um-segredo-forte"
 /corte Hook inicial | 00:15 01:05
 ```
 
-Tambem aceita `hh:mm:ss`. O corte tem limite de 20 minutos.
+Tambem aceita `hh:mm:ss`. O corte tem limite de 20 minutos. O bot envia a previa no Telegram e guarda o arquivo final em alta qualidade para upload posterior.
 
 ### Gerar varios cortes em sequencia
 
@@ -115,6 +120,14 @@ O bot responde com a lista numerada da pasta configurada. Depois selecione um it
 ```text
 /carregar 2
 ```
+
+### Enviar o ultimo corte para o YouTube
+
+```text
+/youtube Meu corte final | Descricao do video
+```
+
+O bot sobe o ultimo corte gerado para o YouTube usando a API oficial e devolve o link do video.
 
 ### Baixar legenda automatica
 
@@ -179,8 +192,9 @@ git push -u origin main
    - `YOUTUBE_COOKIES_BASE64` se o YouTube bloquear downloads com mensagem de anti-bot
    - `GOOGLE_DRIVE_FOLDER_ID` se quiser listar videos da pasta do Drive
    - `GOOGLE_SERVICE_ACCOUNT_JSON_BASE64` para autenticar no Google Drive
-   - `WEBHOOK_URL` se quiser reduzir uso continuo de polling
-   - `WEBHOOK_SECRET_TOKEN` recomendado se ativar webhook
+   - `YOUTUBE_CLIENT_ID`, `YOUTUBE_CLIENT_SECRET` e `YOUTUBE_REFRESH_TOKEN` se quiser usar `/youtube`
+    - `WEBHOOK_URL` se quiser reduzir uso continuo de polling
+    - `WEBHOOK_SECRET_TOKEN` recomendado se ativar webhook
 4. O Railway usara:
    - `Procfile` com `worker: python bot.py`
    - `railway.json` com `startCommand` igual a `python bot.py`
@@ -258,3 +272,21 @@ Observacao:
 
 - `/aut` continua sendo exclusivo para videos carregados do YouTube
 - Para videos do Drive, se voce quiser usar `/maquina`, sera preciso carregar uma legenda `.srt` por outro fluxo
+
+## Upload para YouTube
+
+Para usar `/youtube`, voce precisa configurar OAuth 2.0 de usuario da API do YouTube.
+
+Variaveis necessarias:
+
+- `YOUTUBE_CLIENT_ID`
+- `YOUTUBE_CLIENT_SECRET`
+- `YOUTUBE_REFRESH_TOKEN`
+- `YOUTUBE_UPLOAD_PRIVACY_STATUS` opcional, padrao `unlisted`
+
+Fluxo esperado:
+
+1. Gere um corte com `/corte` ou `/cortes`
+2. Confira a previa no Telegram
+3. Envie `/youtube TITULO | DESCRICAO`
+4. O bot sobe o arquivo final em alta qualidade e responde com o link do YouTube

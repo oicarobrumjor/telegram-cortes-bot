@@ -10,10 +10,12 @@ from pathlib import Path
 from typing import Any, Dict, Optional
 
 import google.generativeai as genai
+from google.auth.transport.requests import Request
 from google.oauth2 import service_account
+from google.oauth2.credentials import Credentials
 from googleapiclient.discovery import build
 from googleapiclient.errors import HttpError
-from googleapiclient.http import MediaIoBaseDownload
+from googleapiclient.http import MediaFileUpload, MediaIoBaseDownload
 from telegram import Update
 from telegram.constants import ChatAction
 from telegram.ext import Application, CommandHandler, ContextTypes
@@ -30,9 +32,12 @@ TELEGRAM_MESSAGE_LIMIT = 4000
 TELEGRAM_VIDEO_LIMIT_BYTES = 49 * 1024 * 1024
 PREVIEW_WIDTH = 640
 PREVIEW_HEIGHT = 360
+FINAL_WIDTH = 1280
+FINAL_HEIGHT = 720
 GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-1.5-flash")
 DEFAULT_WEBHOOK_PATH = "telegram"
 GOOGLE_DRIVE_SCOPES = ["https://www.googleapis.com/auth/drive.readonly"]
+YOUTUBE_UPLOAD_SCOPES = ["https://www.googleapis.com/auth/youtube.upload"]
 
 
 logging.basicConfig(
@@ -129,6 +134,29 @@ def build_drive_service():
         scopes=GOOGLE_DRIVE_SCOPES,
     )
     return build("drive", "v3", credentials=credentials, cache_discovery=False)
+
+
+def build_youtube_service():
+    client_id = os.getenv("YOUTUBE_CLIENT_ID", "").strip()
+    client_secret = os.getenv("YOUTUBE_CLIENT_SECRET", "").strip()
+    refresh_token = os.getenv("YOUTUBE_REFRESH_TOKEN", "").strip()
+
+    if not client_id or not client_secret or not refresh_token:
+        raise RuntimeError(
+            "Upload para YouTube nao configurado. Defina YOUTUBE_CLIENT_ID, "
+            "YOUTUBE_CLIENT_SECRET e YOUTUBE_REFRESH_TOKEN."
+        )
+
+    credentials = Credentials(
+        token=None,
+        refresh_token=refresh_token,
+        token_uri="https://oauth2.googleapis.com/token",
+        client_id=client_id,
+        client_secret=client_secret,
+        scopes=YOUTUBE_UPLOAD_SCOPES,
+    )
+    credentials.refresh(Request())
+    return build("youtube", "v3", credentials=credentials, cache_discovery=False)
 
 
 def list_drive_videos() -> list[Dict[str, Any]]:
@@ -244,6 +272,14 @@ def normalize_time_label(value: str) -> str:
     return value.strip()
 
 
+def format_seconds_to_label(total_seconds: int) -> str:
+    hours, remainder = divmod(total_seconds, 3600)
+    minutes, seconds = divmod(remainder, 60)
+    if hours:
+        return f"{hours:02d}:{minutes:02d}:{seconds:02d}"
+    return f"{minutes:02d}:{seconds:02d}"
+
+
 def find_first_existing_file(chat_dir: Path, patterns: list[str]) -> Optional[Path]:
     for pattern in patterns:
         files = sorted(chat_dir.glob(pattern))
@@ -349,9 +385,9 @@ def run_ffmpeg_cut(
                 "-vf",
                 preview_filter,
                 "-preset",
-                "veryfast",
+                "ultrafast",
                 "-crf",
-                "30",
+                "32",
                 "-c:a",
                 "aac",
                 "-b:a",
@@ -359,8 +395,14 @@ def run_ffmpeg_cut(
             ]
         )
     else:
+        final_filter = (
+            f"scale=w={FINAL_WIDTH}:h={FINAL_HEIGHT}:force_original_aspect_ratio=decrease,"
+            f"pad={FINAL_WIDTH}:{FINAL_HEIGHT}:(ow-iw)/2:(oh-ih)/2:color=black"
+        )
         command.extend(
             [
+                "-vf",
+                final_filter,
                 "-preset",
                 "slow",
                 "-crf",
@@ -521,6 +563,7 @@ async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
         "/carregar NUMERO\n"
         "/corte NOME | INICIO FIM\n"
         "/cortes NOME | INICIO FIM ; NOME | INICIO FIM\n"
+        "/youtube TITULO | DESCRICAO\n"
         "/aut\n"
         "/legenda\n"
         "/maquina\n"
@@ -650,25 +693,55 @@ def parse_batch_cuts(payload: str) -> list[tuple[str, str, str]]:
     return items
 
 
-async def corte_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+def upload_video_to_youtube(file_path: Path, title: str, description: str) -> Dict[str, str]:
+    privacy_status = os.getenv("YOUTUBE_UPLOAD_PRIVACY_STATUS", "unlisted").strip() or "unlisted"
+
+    try:
+        service = build_youtube_service()
+        request = service.videos().insert(
+            part="snippet,status",
+            body={
+                "snippet": {
+                    "title": title,
+                    "description": description,
+                },
+                "status": {
+                    "privacyStatus": privacy_status,
+                },
+            },
+            media_body=MediaFileUpload(str(file_path), chunksize=1024 * 1024, resumable=True),
+        )
+        response = None
+        while response is None:
+            _, response = request.next_chunk()
+    except HttpError as exc:
+        logger.exception("Erro ao subir video para o YouTube")
+        raise RuntimeError("Nao foi possivel enviar o corte para o YouTube.") from exc
+    except Exception as exc:
+        logger.exception("Falha inesperada no upload para o YouTube")
+        raise RuntimeError("Falha ao autenticar ou enviar o corte para o YouTube.") from exc
+
+    video_id = response.get("id")
+    if not video_id:
+        raise RuntimeError("O YouTube nao retornou um ID de video apos o upload.")
+
+    return {
+        "video_id": video_id,
+        "url": f"https://www.youtube.com/watch?v={video_id}",
+        "privacy_status": privacy_status,
+    }
+
+
+async def process_single_cut(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+    clip_name: str,
+    start_label: str,
+    end_label: str,
+) -> None:
     if not update.message:
         return
 
-    raw_text = update.message.text or ""
-    _, _, payload = raw_text.partition(" ")
-    payload = payload.strip()
-    if "|" not in payload:
-        await update.message.reply_text("Uso: /corte NOME | INICIO FIM")
-        return
-
-    name_part, _, time_part = payload.partition("|")
-    clip_name = name_part.strip()
-    time_tokens = time_part.strip().split()
-    if not clip_name or len(time_tokens) != 2:
-        await update.message.reply_text("Uso: /corte NOME | INICIO FIM")
-        return
-
-    start_label, end_label = time_tokens
     try:
         start_seconds = parse_time_to_seconds(start_label)
         end_seconds = parse_time_to_seconds(end_label)
@@ -679,7 +752,8 @@ async def corte_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
     if end_seconds <= start_seconds:
         await update.message.reply_text("O horario final precisa ser maior que o inicial.")
         return
-    if end_seconds - start_seconds > MAX_CUT_SECONDS:
+    duration_seconds = end_seconds - start_seconds
+    if duration_seconds > MAX_CUT_SECONDS:
         await update.message.reply_text("O corte pode ter no maximo 20 minutos.")
         return
 
@@ -697,7 +771,7 @@ async def corte_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
         if path.exists():
             path.unlink(missing_ok=True)
 
-    await update.message.reply_text("Gerando o corte em alta qualidade e uma previa para conferencia.")
+    await update.message.reply_text(f"Gerando corte: {clip_name}")
     await context.bot.send_chat_action(chat_id=chat_id, action=ChatAction.UPLOAD_VIDEO)
 
     try:
@@ -748,25 +822,45 @@ async def corte_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
             )
     except Exception:
         logger.exception("Falha ao enviar previa do corte do chat %s", chat_id)
-        await update.message.reply_text("A previa do corte falhou, mas vou enviar o arquivo final em seguida.")
+        await update.message.reply_text("A previa do corte falhou, mas o arquivo final foi salvo.")
 
-    try:
-        with output_path.open("rb") as video_file:
-            await update.message.reply_document(
-                document=video_file,
-                filename=output_path.name,
-                caption=f"{caption}\n\nArquivo final em melhor qualidade.",
-                read_timeout=120,
-                write_timeout=120,
-                connect_timeout=30,
-                pool_timeout=30,
-            )
-    except Exception:
-        logger.exception("Falha ao enviar corte do chat %s", chat_id)
-        await update.message.reply_text(
-            "O corte foi gerado, mas houve falha ao enviar o arquivo no Telegram. "
-            "Tente um trecho menor."
-        )
+    state["latest_cut"] = {
+        "name": clip_name,
+        "start_label": start_label,
+        "end_label": end_label,
+        "duration_seconds": duration_seconds,
+        "final_path": str(output_path),
+        "preview_path": str(preview_path),
+        "source_title": state.get("title"),
+        "suggested_title": f"{state.get('title', 'Corte')} - {clip_name}",
+    }
+    save_state(chat_id, state)
+    await update.message.reply_text(
+        "Previa enviada. O arquivo final em alta qualidade ficou salvo para upload.\n\n"
+        "Use /youtube TITULO | DESCRICAO para enviar esse ultimo corte ao seu canal."
+    )
+
+
+async def corte_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not update.message:
+        return
+
+    raw_text = update.message.text or ""
+    _, _, payload = raw_text.partition(" ")
+    payload = payload.strip()
+    if "|" not in payload:
+        await update.message.reply_text("Uso: /corte NOME | INICIO FIM")
+        return
+
+    name_part, _, time_part = payload.partition("|")
+    clip_name = name_part.strip()
+    time_tokens = time_part.strip().split()
+    if not clip_name or len(time_tokens) != 2:
+        await update.message.reply_text("Uso: /corte NOME | INICIO FIM")
+        return
+
+    start_label, end_label = time_tokens
+    await process_single_cut(update, context, clip_name, start_label, end_label)
 
 
 async def cortes_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -789,8 +883,55 @@ async def cortes_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     await update.message.reply_text(f"Recebi {len(batch_items)} cortes. Vou processar em sequencia.")
 
     for clip_name, start_label, end_label in batch_items:
-        update.message.text = f"/corte {clip_name} | {start_label} {end_label}"
-        await corte_command(update, context)
+        await process_single_cut(update, context, clip_name, start_label, end_label)
+
+
+async def youtube_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not update.message:
+        return
+
+    raw_text = update.message.text or ""
+    _, _, payload = raw_text.partition(" ")
+    payload = payload.strip()
+    if "|" not in payload:
+        await update.message.reply_text("Uso: /youtube TITULO | DESCRICAO")
+        return
+
+    title_part, _, description_part = payload.partition("|")
+    video_title = title_part.strip()
+    description = description_part.strip()
+    if not video_title:
+        await update.message.reply_text("Informe um titulo para o upload.")
+        return
+
+    chat_id = update.effective_chat.id
+    state = load_state(chat_id)
+    latest_cut = state.get("latest_cut") or {}
+    final_path = latest_cut.get("final_path")
+    if not final_path or not Path(final_path).exists():
+        await update.message.reply_text("Nenhum corte final pronto foi encontrado. Gere um /corte primeiro.")
+        return
+
+    await update.message.reply_text("Enviando o ultimo corte em alta qualidade para o YouTube.")
+    await context.bot.send_chat_action(chat_id=chat_id, action=ChatAction.UPLOAD_VIDEO)
+
+    try:
+        upload_result = await asyncio.to_thread(
+            upload_video_to_youtube,
+            Path(final_path),
+            video_title,
+            description,
+        )
+    except RuntimeError as exc:
+        await update.message.reply_text(str(exc))
+        return
+
+    await update.message.reply_text(
+        "Upload concluido no YouTube.\n\n"
+        f"Titulo: {video_title}\n"
+        f"Privacidade: {upload_result['privacy_status']}\n"
+        f"Link: {upload_result['url']}"
+    )
 
 
 async def limpar_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -943,6 +1084,7 @@ def build_application() -> Application:
     application.add_handler(CommandHandler("carregar", carregar_command))
     application.add_handler(CommandHandler("corte", corte_command))
     application.add_handler(CommandHandler("cortes", cortes_command))
+    application.add_handler(CommandHandler("youtube", youtube_command))
     application.add_handler(CommandHandler("limpar", limpar_command))
     application.add_handler(CommandHandler("aut", aut_command))
     application.add_handler(CommandHandler("legenda", legenda_command))
