@@ -134,19 +134,29 @@ def download_video_for_chat(chat_id: int, url: str) -> Dict[str, Any]:
 
     ydl_opts = {
         "outtmpl": output_template,
-        "format": "bestvideo+bestaudio/best",
+        "format": "bv*+ba/b",
         "merge_output_format": "mp4",
         "noplaylist": True,
         "quiet": True,
         "no_warnings": True,
+        "extractor_args": {
+            "youtube": {
+                "player_client": ["android", "web"],
+            }
+        },
     }
 
     try:
         with YoutubeDL(ydl_opts) as ydl:
             info = ydl.extract_info(url, download=True)
     except DownloadError as exc:
-        logger.warning("Erro ao baixar video do chat %s: %s", chat_id, exc)
-        raise RuntimeError("Nao foi possivel baixar o video. Verifique o link e tente novamente.") from exc
+        error_text = str(exc).strip()
+        logger.warning("Erro ao baixar video do chat %s: %s", chat_id, error_text)
+        if "Sign in to confirm" in error_text or "bot" in error_text.lower():
+            raise RuntimeError(
+                "O YouTube bloqueou este download no momento. Tente outro video publico ou atualize o yt-dlp."
+            ) from exc
+        raise RuntimeError(f"Nao foi possivel baixar o video: {error_text[:300]}") from exc
     except Exception as exc:
         logger.exception("Falha inesperada no download do chat %s", chat_id)
         raise RuntimeError("Ocorreu um erro inesperado ao baixar o video.") from exc
